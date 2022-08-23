@@ -1,0 +1,483 @@
+#!/bin/bash
+#set -x
+
+# treat access to unbound variable as error to catch typos <當執行到未定義的變數時中斷執行>
+set -u
+
+# avoid environment influence <刪除所有別名>
+unalias -a
+unset ENV
+unset LD_BIND_NOW
+
+# for unknown reasons the software has issues when the environment
+# variable LC_ALL is set to 'C' - not a great thing but we just unset it
+unset LC_ALL
+
+# CD_PATH also has some issues
+unset CD_PATH
+
+
+# the whole purpose of 'run' is to create an execution environment for
+# the UNO component software.
+# technically this means that some files are created by run. every
+# user should be able to run "run" to recreate this stuff regardless
+# who (if any) executed the script before.
+# to ensure that we lower the umask to 000 during script execution.
+# that means that all files / directories created by "run" are rw(x) to
+# everybody and can be removed and remade by everybody.
+# however, once we pass control to the executor we have to restore the
+# old umask - the user has to make up his own mind concerning stuff her
+# code creates...     <修改讀寫權限>
+SAVED_UMASK=$(umask)
+umask 000
+
+# prepare some vars for installation-places.
+# the location of the run script itself acts as anchor
+# all other locations are found relative to the run script
+ABSME=$(readlink -f $0)
+ME=$(basename $ABSME)
+
+# the following (lowercase) variables are used throughout this script
+# and its functions to 'find stuff'
+bin_dir=$(dirname $ABSME)
+inst_dir=$(dirname $bin_dir)
+sbin_dir=$inst_dir/sbin
+lib_cache=$inst_dir/lib
+ccd_cache=$inst_dir/config
+component_dir=$inst_dir/ucomp
+cache_dir=$inst_dir/cache
+conf_dir=$inst_dir/etc
+idl_dir=$inst_dir/idl
+log_dir=$inst_dir/log
+
+# the environment variables XOC_SYSTEM is the 'anchor'
+# for many things
+export XOC_SYSTEM=$inst_dir
+
+# if the shipment root is not given from outside try to extract it
+# from the properties file  <如果字串長度是0，就指定一個>
+if [[ -z ${SHIPMENT_ROOT:-} ]]
+then
+  SHIPMENT_ROOT="$(grep '^HP83000_ROOT=' $XOC_SYSTEM/properties | sed -e 's/^[^"]*"//' -e 's/"$//')"
+fi
+
+# as last resort (shipment root still undefined) use the hard coded default
+if [[ -z ${SHIPMENT_ROOT:-} ]]
+then
+  SHIPMENT_ROOT=/opt/hp93000/soc
+fi
+
+export SHIPMENT_ROOT
+
+# since 7.1 (consolidated build) the hp83000 root is ALWAYS the same
+export HP83000_ROOT=$SHIPMENT_ROOT
+
+# Using UNO4 (this software version has been build using UNO4)
+#
+export XOC_BUILD_WITH_UNO4=true
+export XOC_BUILD_WITH_UNO6=true # activate build against UNO6
+
+# disable UNO6 logging statements (if running in a debug build)
+export SAL_LOG=""
+
+# this script uses a lot of functions. for better maintainability they
+# are stored as separate files in a directory '.shinc' that is a sibling
+# to run. all files there with a '.rf' extension are bulk-loaded
+for a in $bin_dir/.shinc/*.rf
+do
+  source $a
+done
+
+setupVarOptLog=/tmp/setupvaroptlog.$$
+if if_running_in_rd > /dev/null 2>&1
+then
+  # the very first thing we have to do is to ensure that the directories
+  # for the variant part of system exist and are properly
+  # linked from system.
+  # notice that we can not use the standard log destination because
+  # the log directory might not jet exist.
+  # if that fails we better give up right now!
+  # (if we are not in R&D the installation routine has done all stuff)
+  $inst_dir/sbin/setupVarOpt > $setupVarOptLog 2>&1
+  if [[ $? -ne 0 ]]
+  then
+    {
+      echo "ERROR $ME: setting up the directory structure under /var/opt/..."
+      echo "and/or creation of links to it failed:"
+      cat $setupVarOptLog
+    } >&2
+  rm -f $setupVarOptLog
+  exit 1
+  fi
+fi
+
+# very early we have to care about editions! if editions are in use then
+# the log, lib, cache and config directory get another level of
+# indirection.
+if if_edition_in_use
+then
+  # get the edition-specivic directory level and add it to the directories in
+  # scope.
+  edition_path_snippet=$(get_edition_subpath)
+  lib_cache=$lib_cache/$edition_path_snippet
+  ccd_cache=$ccd_cache/$edition_path_snippet
+  cache_dir=$cache_dir/$edition_path_snippet
+  log_dir=$log_dir/$edition_path_snippet
+  # make sure the directories exist
+  globerr=0
+  mkdir -p $lib_cache || globerr=1
+  mkdir -p $ccd_cache || globerr=1
+  mkdir -p $cache_dir || globerr=1
+  mkdir -p $log_dir || globerr=1
+  # if we got an error here w better give up
+  if [[ $globerr -ne 0 ]]
+  then
+    echo "ERROR creating edition specivic directories" >&2
+    exit 1
+  fi
+fi
+
+cached_acf=$cache_dir/cached_acf
+
+# the environment variables XOC_SYSTEM and ZENITH_RC_FILE are 'anchors'
+# for many things
+#export XOC_SYSTEM=$inst_dir - already exported.
+export XOC_CACHE_DIR=$cache_dir
+export ZENITH_RC_FILE=$cache_dir/zenith.rc
+export XOC_LIB_DIR=$lib_cache
+
+# logging is one of the first things we need
+# if the environment variable XOC_LOG_FILE is empty
+# or unset we determine the log destination following some rules.
+# if XOC_LOG_FILE is non-zero we take it as is.
+if [ -z ${XOC_RUN_LOG_FILE:-} ]
+then
+  export XOC_LOG_DIR=$(find_log_dir)
+  export XOC_RUN_LOG_FILE=$XOC_LOG_DIR/ATE.slg
+else
+  # log file given, derive log dir
+  export XOC_LOG_DIR=$(dirname $XOC_RUN_LOG_FILE)
+fi
+
+if ! [ -e $XOC_LOG_DIR/CompleteSystem.slg_README.txt ]
+then
+  cp $sbin_dir/CompleteSystem.slg_README.txt $XOC_LOG_DIR
+fi
+
+# the ISO date format log entry is requested to support parsing / time-syncing all kinds of log files
+log_no_pid "$(date --iso-8601=ns | tr 'T' ' ') INFO run log started"
+log "**********##########**********1111111111**********##########**********"
+# and tis one has been around for more than 10 years by now - I am not going to remove that.
+log "run log started at $(date)"
+log "by user $(id)"
+log "on $(uname -n)"
+
+# collect the log output from setupVarOpt if it exists
+if [[ -r $setupVarOptLog ]]
+then
+  log "Logging data from setupVarOpt (runs before log dir needs to exist!)"
+  cat $setupVarOptLog >> $XOC_RUN_LOG_FILE
+  rm -f $setupVarOptLog
+  log "End logging data from setupVarOpt"
+fi
+
+# default the option values
+export XOC_EXECUTOR=""
+export XOC_SESSION="default"
+export XOC_SESSION_VERSION="1"
+export XOC_PROCESS="Process1"
+export XOC_PORT="9999"
+# editions make a big difference for the ACF. in non-edition mode the ACF
+# is a source file; in edition mode it is a derived file!
+if if_edition_in_use
+then
+  # notice that we do NOT put the ACF file into the chache directory!
+  # we store it as a sibling file to the edition cache directory; we do
+  # so because we clean out the cache on several occasions - removing
+  # the ACF file this way would be a bad idea
+  export ACF=${cache_dir}_active_components.cf
+else
+  export ACF=$(dirname $(dirname $ABSME))/etc/active_components.cf
+fi
+
+# the run script is not only used to start up
+# a session but also for other purpose like starting up the gui, killing
+# stuff, wrapping UNO-aware executables and more
+# in this cases the whole environment construction, building of registries
+# and session startup is not needed and only takes time.
+# we provide a 'quickstart' option that only ensures that a session
+# manager is running and executes
+# the executor with the various environment variables set
+# the default is not to quickstart, of course
+export XOC_QUICK_START="n"
+# really quick also omits session manager start
+export XOC_REALLY_QUICK_START="n"
+# the 'command type' options
+OPT_CLEAR_CACHE='n'
+OPT_KILL_SESSION_MANAGER='n'
+OPT_KILL_STARTER='n'
+OPT_USAGE_ONLY='n'
+OPT_SHELL_ONLY='n'
+# by default the content of SM_STARTER_PRE_ARGS is not applied to the command
+# directly executed by run
+OPT_APPLY_PRE_ARGS='n'
+
+
+# Check for the existence of environment variable XOC_RUN_OPTIONS.
+# If set its contents is prepended to the passed in options
+
+if [ -z "${XOC_RUN_OPTIONS:-}" ]
+then
+  log "Environment variable XOC_RUN_OPTIONS not set"
+  set -- "$@"
+else
+  log "Environment variable XOC_RUN_OPTIONS set: >$XOC_RUN_OPTIONS<"
+  log "prepending contents to call arguments"
+  set -- $XOC_RUN_OPTIONS "$@"
+fi
+
+
+
+log "Effective option list is >$*< ($# arguments)"
+
+# now process options
+while getopts ":v:cKka:s:p:x:qQXSP" x
+do
+  case $x in
+    ( "c" ) OPT_CLEAR_CACHE='y' ;;
+    ( "K" ) OPT_KILL_SESSION_MANAGER='y' ; OPT_KILL_STARTER='y' ;;
+    ( "k" ) OPT_KILL_STARTER='y' ;;
+    ( "a" ) ACF=$OPTARG ;;
+    ( "s" ) XOC_SESSION=$OPTARG ;;
+    ( "v" ) XOC_SESSION_VERSION=$OPTARG ;;
+    ( "p" ) XOC_PROCESS=$OPTARG ;;
+    ( "x" ) XOC_EXECUTOR=$OPTARG ;;
+    ( "q" ) XOC_QUICK_START="y" ;;
+    ( "Q" ) XOC_QUICK_START="y" ; XOC_REALLY_QUICK_START="y" ;;
+    ( "X" ) set -x ;;
+    ( "S" ) OPT_SHELL_ONLY='y' ;;
+    ( "P" ) OPT_APPLY_PRE_ARGS='y' ;;
+    ( "?" ) OPT_USAGE_ONLY='y' ; log "Illegal option $OPTARG" ;;
+    ( ":" ) OPT_USAGE_ONLY='y' ; log "Option $OPTARG needs an argument" ;;
+    ( * ) OPT_USAGE_ONLY='y' ; log "Argument error" ;;
+  esac
+done
+
+
+# shift out the run options and keep the reminder for the executor
+shift $(($OPTIND - 1))
+
+# Get arguments as array to not expand quoted arguments with a blank inside.
+# Note:
+# We later invoke the array as "${XOC_EXECUTOR_ARGUMENTS[@]}" to assure, that
+# quoted arguments with spaces inside would not be expanded to single ones.
+# Please don't optimize this mechanism as otherwise the application 
+# "../pws/bin/acal" when called by the xoc-wrapper with quoted string-args
+# would fail. 
+XOC_EXECUTOR_ARGUMENTS=("$@")
+
+if [ $OPT_USAGE_ONLY = 'y' ]
+then
+  print_usage
+  die 1 "Illegal option or option parameter found"
+fi
+
+
+# if we should only exec a shell in the usual process environment
+# we do that here without further ado.
+# notice that exec_shell_in_env never returns
+if [ $OPT_SHELL_ONLY = 'y' ]
+then
+  log "executing your SHELL in usual process environment"
+  # Don't pass array "${XOC_EXECUTOR_ARGUMENTS[@]:-}" to command if empty
+  # as it expands to a null-argument (the called command might not expect this!).    
+  if [ -z "${XOC_EXECUTOR_ARGUMENTS[0]:-}" ]; then
+    exec_shell_in_env
+  else
+    exec_shell_in_env "${XOC_EXECUTOR_ARGUMENTS[@]}"
+  fi
+    
+fi
+
+
+# clearing of the cache has an influence on system construction
+# so we have to do this very early
+[ $OPT_CLEAR_CACHE = 'y' ] && clear_cache
+
+# the active components file plays a central role. if it has been
+# changed since last startup we have to re-build all runtime
+# we force this re-build by clearing the cache
+log "check if ACF file $ACF has been changed since last usage"
+if if_acf_has_changed
+then
+  log "ACF has changed; clearing cache to force re-build of run-time"
+  clear_cache
+fi
+
+# if we are running in the R&D development environment we do some
+# ad-hoc construction of the 'system'. if we ar running in an installed
+# environment the construction has been done statically
+# in R&D we also check if the OS we are running is the OS the software
+# is built for.
+if if_running_in_rd
+then
+  log "Checking OS compatibility"
+  check_linux_version || die 1 "Linux version mismatch"
+  log "Constructing system (if necessary)"
+  construct_system || die 1 "Construction of system from BOM failed"
+fi
+
+# the main system generation is done. that means the system is now 
+# basically in the same shape as RPM would install the files.
+# now do the edition processing.
+# the main job is to produce an ACF file. the ACF file is now generated
+# from one or more edition specifiers (XML files).
+# this is a bit of a lengthy process so we will do this only if necessary.
+# borrowing the system signature approach we check a edition signature covering
+# all the edition specifier files (and their sequence).
+# if out of date we rebuild the stuff in the (edition-local) cache directory.
+if if_edition_in_use
+then
+  # update the edition and export the edition implementation names
+  # for anybode who is concerned
+  log "Checking and re-generating (if needed) the edition configuration"
+  check_and_rebuild_edition || die 1 "Could not create Edition"
+  export_edition_implementation
+fi
+
+# execute the "commands"
+[ $OPT_KILL_STARTER = 'y' ] && kill_starters
+[ $OPT_KILL_SESSION_MANAGER = 'y' ] && kill_session_manager
+
+# we keep a signature of the current system (file attributes of libs,
+# registries...) that we validate on every startup to catch changes
+# in the system structure that require a re-build of the runtime
+# cache. if we are running in R&D then 'construct_system' has done
+# this already
+if ! if_running_in_rd
+then
+  validate_system_signature || clear_cache
+fi
+
+# we do some validation now; this includes the passed parameters as
+# well as checking the OS environment.
+log "checking command line parameters"
+check_parameters || die 1 "Checking of command line parameters failed"
+log "checking Linux environment"
+check_linux_settings || die 1 "Checking of Linux environment failed"
+
+
+# define environment variables needed. some of them were set already
+# because they act as default values during option processing.
+log "defining environment variables"
+define_environment_variables || die 1 "Defining environment variables failed"
+
+
+# we need some runtime environment. there are libraries to cache, registry
+# databases to build and lots of checks to be done.
+# the result of this (at least the most prominent one) is a filled 'cache'
+# so the degree of emptyness of this cache is a good way to determine
+# if we need to (re-)build the component runtime.
+if if_cache_empty
+then
+  # this is a lengthy operation, write some message to stdout to
+  # show we are still alive. make sure strings appearing on screen
+  # are also in the log file!
+  echo "Building library / service cache... ($cache_dir)"
+  log "Building library / service cache... ($cache_dir)"
+  log "building component runtime environment"
+  build_component_runtime \
+  || die 1 "Building of component runtime environment failed"
+  log "building service lookup database"
+  build_service_lookup_db \
+  || die 1 "Building of service lookup database failed"
+  echo "Done with building library / service cache"
+  log "Done with building library / service cache"
+fi
+
+
+# the real big things are done by now. what is left is to ensure that
+# a session manager is running, that a session exists and to call the
+# executor and let it do whatever it wants.
+# However, there are two 'quick' options that are used to skip some of
+# this steps.
+# the 'quick' (option 'q') mode omits the check for and the creation 
+# of a session.
+# the 'really quick' (option 'Q') mode omits also the checking and launching
+# of the session manager process.
+if [ $XOC_REALLY_QUICK_START = 'n' ]
+then
+  log "checking for and launching session manager"
+  check_launch_session_manager || die 1 "Launch of session manager failed"
+fi 
+
+if [ $XOC_QUICK_START = 'n' ]
+then
+  if [ $XOC_SESSION != "default" ]
+  then
+    log "checking for and making session $XOC_SESSION"
+    check_make_session || die 1 "Session creation failed"
+  fi
+fi
+
+# when the environment variable SM_STARTER_PRE_ARGS is defined then the starter
+# library and the starter process representant put its content
+# as a prefix into the 'exec' command line. That might be used to execute
+# given services under 'valgrind', for instance.
+# now (Nov. 2014) there is a desire that the run script does the same - regardless
+# what actually is executed by it.
+# This is quite a change in fuctionality, therefore a new option is introduced that
+# gates this pre-args.
+# in other words, only if SM_STARTER_PRE_ARGS is non-empty AND if the option -P (uppercase!) is given
+# the magic is unleashed.
+run_pre_cmd=""
+if [[ ${OPT_APPLY_PRE_ARGS} == 'y' ]]
+then
+  if [[ -n ${SM_STARTER_PRE_ARGS:-} ]]
+  then
+    # there are pre-args and they should be applied
+    run_pre_cmd=${SM_STARTER_PRE_ARGS}
+  fi
+fi
+
+# we made it! we reached the point where we transfer control to the
+# executor. before we save the system signature file that is used during
+# 'construct_system' to avoid unnecessary work. we do that now because to
+# our best knowledge the system is OK when we reach this line.
+save_system_signature
+
+# following the same logic we also save the edition signature
+if_edition_in_use && save_edition_signature
+
+# we also restore the users umask.
+umask $SAVED_UMASK
+
+if [ -z $XOC_EXECUTOR ]
+then
+  print_usage
+  die 1 "You must specify an executor (option x)"
+fi
+
+if [ "0" != "$XOC_EXECUTOR" ]
+then
+  log "@@@ exec ${run_pre_cmd} $XOC_EXECUTOR ${XOC_EXECUTOR_ARGUMENTS[@]:-}"
+    # Don't pass array "${XOC_EXECUTOR_ARGUMENTS[@]:-}" to command if empty
+    # as it expands to a null-argument (the called command might not expect this!).    
+  if [ -z "${XOC_EXECUTOR_ARGUMENTS[0]:-}" ]; then
+    exec ${run_pre_cmd} ${XOC_EXECUTOR}
+  else
+    exec ${run_pre_cmd} ${XOC_EXECUTOR} "${XOC_EXECUTOR_ARGUMENTS[@]}"
+  fi
+  # now that we 'exec' the executer (nad not just call it)
+  # the following lines are not reached anymore...
+  #EXEC_STATE=$?
+  #log "executor returned exit code $EXEC_STATE"
+else
+  log "@@@ skipping NULL ($XOC_EXECUTOR) executor"
+  EXEC_STATE=0
+fi
+log "______________________________________________________________________"
+die $EXEC_STATE "Regular termination of $ME"
+
+# below is for jedit
+#:mode=shellscript:
